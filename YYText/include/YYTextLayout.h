@@ -269,6 +269,8 @@ extern const CGSize YYTextContainerMaxSize;
 @property (nonatomic, readonly) BOOL needDrawStrikethrough;
 ///< Has border attribute
 @property (nonatomic, readonly) BOOL needDrawBorder;
+///< Has bubble attribute
+@property (nonatomic, readonly) BOOL needDrawBubble;
 
 
 #pragma mark - Query information from text layout

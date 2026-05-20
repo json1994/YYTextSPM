@@ -17,6 +17,7 @@ FOUNDATION_EXPORT const unsigned char YYTextVersionString[];
 #import <YYText/YYLabel.h>
 #import <YYText/YYTextView.h>
 #import <YYText/YYTextAttribute.h>
+#import <YYText/YYTextBubble.h>
 #import <YYText/YYTextArchiver.h>
 #import <YYText/YYTextParser.h>
 #import <YYText/YYTextRunDelegate.h>
@@ -34,6 +35,7 @@ FOUNDATION_EXPORT const unsigned char YYTextVersionString[];
 #import "YYLabel.h"
 #import "YYTextView.h"
 #import "YYTextAttribute.h"
+#import "YYTextBubble.h"
 #import "YYTextArchiver.h"
 #import "YYTextParser.h"
 #import "YYTextRunDelegate.h"

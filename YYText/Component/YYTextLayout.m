@@ -12,6 +12,7 @@
 #import "YYTextLayout.h"
 #import "YYTextUtilities.h"
 #import "YYTextAttribute.h"
+#import "YYTextBubble.h"
 #import "YYTextArchiver.h"
 #import "NSAttributedString+YYText.h"
 
@@ -337,6 +338,7 @@ dispatch_semaphore_signal(_lock);
 @property (nonatomic, readwrite) BOOL needDrawInnerShadow;
 @property (nonatomic, readwrite) BOOL needDrawStrikethrough;
 @property (nonatomic, readwrite) BOOL needDrawBorder;
+@property (nonatomic, readwrite) BOOL needDrawBubble;
 
 @property (nonatomic, assign) NSUInteger *lineRowsIndex;
 @property (nonatomic, assign) YYRowEdge *lineRowsEdge; ///< top-left origin
@@ -830,6 +832,7 @@ dispatch_semaphore_signal(_lock);
             if (attrs[YYTextInnerShadowAttributeName]) layout.needDrawInnerShadow = YES;
             if (attrs[YYTextStrikethroughAttributeName]) layout.needDrawStrikethrough = YES;
             if (attrs[YYTextBorderAttributeName]) layout.needDrawBorder = YES;
+            if (attrs[YYTextBubbleAttributeName]) layout.needDrawBubble = YES;
         };
         
         [layout.text enumerateAttributesInRange:visibleRange options:NSAttributedStringEnumerationLongestEffectiveRangeNotRequired usingBlock:block];
@@ -2830,6 +2833,229 @@ static void YYTextDrawBorder(YYTextLayout *layout, CGContextRef context, CGSize 
     CGContextRestoreGState(context);
 }
 
+#pragma mark - Bubble drawing
+
+static void YYTextDrawBubble(YYTextLayout *layout, CGContextRef context, CGSize size, CGPoint point, BOOL (^cancel)(void)) {
+    NSArray<YYTextLine *> *lines = layout.lines;
+    if (lines.count == 0) return;
+    if (layout.container.verticalForm) return; // Bubble only supports horizontal layout.
+    
+    CGContextSaveGState(context);
+    CGContextTranslateCTM(context, point.x, point.y);
+    
+    // Pass 1 — Walk every run on every line and accumulate one rect per
+    // contiguous bubble span on each line.
+    NSMutableArray<NSMutableArray<NSDictionary *> *> *perLine = [NSMutableArray arrayWithCapacity:lines.count];
+    
+    for (NSInteger l = 0; l < (NSInteger)lines.count; l++) {
+        if (cancel && cancel()) {
+            CGContextRestoreGState(context);
+            return;
+        }
+        YYTextLine *line = lines[l];
+        if (layout.truncatedLine && layout.truncatedLine.index == line.index) line = layout.truncatedLine;
+        
+        NSMutableArray<NSDictionary *> *segs = [NSMutableArray new];
+        CFArrayRef runs = CTLineGetGlyphRuns(line.CTLine);
+        CFIndex rCount = CFArrayGetCount(runs);
+        
+        YYTextBubble *current = nil;
+        CGRect currentRect = CGRectNull;
+        
+        CGFloat lineTop    = line.position.y - line.ascent;
+        CGFloat lineBottom = line.position.y + line.descent;
+        
+        for (CFIndex r = 0; r < rCount; r++) {
+            CTRunRef run = CFArrayGetValueAtIndex(runs, r);
+            if (CTRunGetGlyphCount(run) == 0) continue;
+            
+            NSDictionary *attrs = (__bridge NSDictionary *)CTRunGetAttributes(run);
+            YYTextBubble *bubble = attrs[YYTextBubbleAttributeName];
+            
+            if (!bubble) {
+                if (current) {
+                    [segs addObject:@{@"bubble": current,
+                                      @"rect":   [NSValue valueWithCGRect:currentRect]}];
+                    current = nil;
+                    currentRect = CGRectNull;
+                }
+                continue;
+            }
+            
+            CGPoint runPos = CGPointZero;
+            CTRunGetPositions(run, CFRangeMake(0, 1), &runPos);
+            CGFloat runWidth = CTRunGetTypographicBounds(run, CFRangeMake(0, 0), NULL, NULL, NULL);
+            CGFloat x = line.position.x + runPos.x;
+            CGRect runRect = CGRectMake(x, lineTop, runWidth, lineBottom - lineTop);
+            
+            if (current && [current isEqual:bubble]) {
+                currentRect = CGRectUnion(currentRect, runRect);
+            } else {
+                if (current) {
+                    [segs addObject:@{@"bubble": current,
+                                      @"rect":   [NSValue valueWithCGRect:currentRect]}];
+                }
+                current = bubble;
+                currentRect = runRect;
+            }
+        }
+        if (current) {
+            [segs addObject:@{@"bubble": current,
+                              @"rect":   [NSValue valueWithCGRect:currentRect]}];
+        }
+        [perLine addObject:segs];
+    }
+    
+    // Pass 2 — Group segments belonging to the *same* bubble across
+    // *consecutive* lines. A gap (a line where the bubble is absent) closes
+    // the current group; if the same bubble shows up again later it forms a
+    // new group.
+    NSMutableArray<NSMutableDictionary *> *groups = [NSMutableArray new];
+    // openGroups: bubble pointer (NSValue nonretained) -> NSMutableDictionary
+    NSMutableDictionary<NSValue *, NSMutableDictionary *> *openGroups = [NSMutableDictionary new];
+    
+    for (NSInteger l = 0; l < (NSInteger)perLine.count; l++) {
+        NSArray<NSDictionary *> *segs = perLine[l];
+        NSMutableSet<NSValue *> *seen = [NSMutableSet new];
+        
+        for (NSDictionary *seg in segs) {
+            YYTextBubble *bubble = seg[@"bubble"];
+            NSValue *key = [NSValue valueWithNonretainedObject:bubble];
+            [seen addObject:key];
+            
+            NSMutableDictionary *grp = openGroups[key];
+            if (grp) {
+                NSInteger lastLine = [grp[@"lastLine"] integerValue];
+                if (lastLine < l - 1) {
+                    [groups addObject:grp];
+                    grp = nil;
+                }
+            }
+            if (!grp) {
+                grp = [NSMutableDictionary new];
+                grp[@"bubble"] = bubble;
+                grp[@"rects"]  = [NSMutableArray new];
+                openGroups[key] = grp;
+            }
+            [grp[@"rects"] addObject:seg[@"rect"]];
+            grp[@"lastLine"] = @(l);
+        }
+        // Close any open group that wasn't seen on this line.
+        for (NSValue *key in openGroups.allKeys) {
+            if (![seen containsObject:key]) {
+                NSMutableDictionary *grp = openGroups[key];
+                if ([grp[@"lastLine"] integerValue] < l) {
+                    [groups addObject:grp];
+                    [openGroups removeObjectForKey:key];
+                }
+            }
+        }
+    }
+    for (NSMutableDictionary *grp in openGroups.allValues) {
+        [groups addObject:grp];
+    }
+    
+    // Pass 3 — Render each group. Within a group, split rects into "fusion
+    // clusters": runs of consecutive lines whose horizontal x-ranges overlap.
+    // Inside one cluster the inter-line spacing is filled and adjacent rects
+    // overlap by `cornerRadius` so their inner rounded corners disappear and
+    // produce a smoothly merged silhouette.
+    for (NSMutableDictionary *grp in groups) {
+        if (cancel && cancel()) break;
+        YYTextBubble *bubble = grp[@"bubble"];
+        NSArray<NSValue *> *rectsArr = grp[@"rects"];
+        if (rectsArr.count == 0) continue;
+        
+        NSMutableArray<NSMutableArray<NSValue *> *> *clusters = [NSMutableArray new];
+        NSMutableArray<NSValue *> *cluster = [NSMutableArray new];
+        
+        for (NSInteger i = 0; i < (NSInteger)rectsArr.count; i++) {
+            CGRect r = rectsArr[i].CGRectValue;
+            if (cluster.count == 0) {
+                [cluster addObject:[NSValue valueWithCGRect:r]];
+                continue;
+            }
+            CGRect prev = cluster.lastObject.CGRectValue;
+            BOOL hOverlap = (CGRectGetMinX(r)    < CGRectGetMaxX(prev)) &&
+                            (CGRectGetMaxX(r)    > CGRectGetMinX(prev));
+            if (hOverlap) {
+                // Fill the line-spacing gap and overlap by cornerRadius so the
+                // facing inner rounded corners are hidden inside the neighbour.
+                CGFloat midY = (CGRectGetMaxY(prev) + CGRectGetMinY(r)) * 0.5;
+                CGFloat overlap = bubble.cornerRadius;
+                
+                CGRect newPrev = prev;
+                newPrev.size.height = (midY + overlap) - newPrev.origin.y;
+                cluster[cluster.count - 1] = [NSValue valueWithCGRect:newPrev];
+                
+                CGRect newCur = r;
+                CGFloat newTop = midY - overlap;
+                newCur.size.height = (newCur.origin.y + newCur.size.height) - newTop;
+                newCur.origin.y = newTop;
+                [cluster addObject:[NSValue valueWithCGRect:newCur]];
+            } else {
+                [clusters addObject:cluster];
+                cluster = [NSMutableArray new];
+                [cluster addObject:[NSValue valueWithCGRect:r]];
+            }
+        }
+        if (cluster.count > 0) [clusters addObject:cluster];
+        
+        // Build one CGPath per cluster (multiple rounded-rect subpaths fused
+        // together by overlap; non-zero winding fill makes them appear as one).
+        NSMutableArray<UIBezierPath *> *clusterPaths = [NSMutableArray new];
+        for (NSArray<NSValue *> *cl in clusters) {
+            UIBezierPath *path = [UIBezierPath bezierPath];
+            for (NSValue *rv in cl) {
+                CGRect rr = rv.CGRectValue;
+                if (rr.size.width <= 0 || rr.size.height <= 0) continue;
+                rr = YYTextCGRectPixelRound(rr);
+                CGFloat radius = MIN(bubble.cornerRadius,
+                                     MIN(rr.size.width, rr.size.height) * 0.5);
+                UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:rr cornerRadius:radius];
+                [path appendPath:p];
+            }
+            if (!path.isEmpty) [clusterPaths addObject:path];
+        }
+        if (clusterPaths.count == 0) continue;
+        
+        YYTextShadow *shadow = bubble.shadow;
+        if (shadow.color) {
+            CGContextSaveGState(context);
+            CGContextSetShadowWithColor(context, shadow.offset, shadow.radius, shadow.color.CGColor);
+            CGContextBeginTransparencyLayer(context, NULL);
+        }
+        
+        if (bubble.fillColor) {
+            CGContextSaveGState(context);
+            CGContextSetFillColorWithColor(context, bubble.fillColor.CGColor);
+            for (UIBezierPath *p in clusterPaths) {
+                CGContextAddPath(context, p.CGPath);
+            }
+            CGContextFillPath(context);
+            CGContextRestoreGState(context);
+        }
+        if (bubble.strokeColor && bubble.strokeWidth > 0) {
+            CGContextSaveGState(context);
+            CGContextSetStrokeColorWithColor(context, bubble.strokeColor.CGColor);
+            CGContextSetLineWidth(context, bubble.strokeWidth);
+            CGContextSetLineJoin(context, kCGLineJoinRound);
+            for (UIBezierPath *p in clusterPaths) {
+                CGContextAddPath(context, p.CGPath);
+            }
+            CGContextStrokePath(context);
+            CGContextRestoreGState(context);
+        }
+        
+        if (shadow.color) {
+            CGContextEndTransparencyLayer(context);
+            CGContextRestoreGState(context);
+        }
+    }
+    
+    CGContextRestoreGState(context);
+}
+
 static void YYTextDrawDecoration(YYTextLayout *layout, CGContextRef context, CGSize size, CGPoint point, YYTextDecorationType type, BOOL (^cancel)(void)) {
     NSArray *lines = layout.lines;
     
@@ -3344,6 +3570,10 @@ static void YYTextDrawDebug(YYTextLayout *layout, CGContextRef context, CGSize s
         if (self.needDrawBackgroundBorder && context) {
             if (cancel && cancel()) return;
             YYTextDrawBorder(self, context, size, point, YYTextBorderTypeBackgound, cancel);
+        }
+        if (self.needDrawBubble && context) {
+            if (cancel && cancel()) return;
+            YYTextDrawBubble(self, context, size, point, cancel);
         }
         if (self.needDrawShadow && context) {
             if (cancel && cancel()) return;
